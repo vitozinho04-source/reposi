@@ -1,0 +1,846 @@
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait, Select
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException
+from webdriver_manager.chrome import ChromeDriverManager
+import time
+import os
+import keyboard
+import concurrent.futures
+from threading import Lock
+import uuid
+import re
+
+# Variável global para controlar pausar/retomar
+paused = False
+processed_accounts = set()
+processed_accounts_lock = Lock()
+proxies_list = []
+proxy_index_lock = Lock()
+current_proxy_index = 0
+
+def check_pause():
+    """Monitora a tecla F2 para alternar o estado de pausa/retomar"""
+    global paused
+    while True:
+        keyboard.wait('f2')
+        paused = not paused
+        state = "PAUSED" if paused else "RESUMED"
+        print(f"[PAUSE] Script {state}. Pressione F2 para {'retomar' if paused else 'pausar'}.")
+        time.sleep(0.3)
+
+def wait_if_paused():
+    """Pausa a execução se a flag global paused for True"""
+    while paused:
+        time.sleep(0.1)
+
+def salvar_conta_erro(email, senha):
+    """Salva a conta no arquivo de erro"""
+    try:
+        caminho_erro = os.path.join(os.path.dirname(__file__), "erro.txt")
+        with open(caminho_erro, 'a', encoding='utf-8') as arquivo:
+            arquivo.write(f"{email}:{senha}\n")
+        print(f"[SAVE] Conta {email} salva em erro.txt")
+    except Exception as e:
+        print(f"[ERROR] Erro ao salvar {email} em erro.txt: {e}")
+
+def salvar_conta_review(email, senha):
+    """Salva a conta no arquivo review2.txt"""
+    try:
+        caminho_review = os.path.join(os.path.dirname(__file__), "review2.txt")
+        with open(caminho_review, 'a', encoding='utf-8') as arquivo:
+            arquivo.write(f"{email}:{senha}\n")
+        print(f"[SAVE] Conta {email} salva em review2.txt")
+    except Exception as e:
+        print(f"[ERROR] Erro ao salvar {email} em review2.txt: {e}")
+
+def verificar_e_tratar_policy(driver, sorteio_url):
+    """
+    Verifica se está na página de policy violation e trata adequadamente
+    Retorna True se conseguiu tratar, False se não havia policy
+    """
+    wait_if_paused()
+    try:
+        current_url = driver.current_url
+        print(f"[CHECK] Verificando policy... URL atual: {current_url}")
+        
+        # Verifica se está na página de policy violation
+        if "policy-violation" in current_url:
+            print("[POLICY] Detectado: Página de Policy Violation!")
+            
+            # Procura e clica no botão "Got it — I'll follow the rules"
+            botao_selectors = [
+                "//button[contains(@class, 'bg-primary-600') and contains(text(), \"Got it — I'll follow the rules\")]",
+                "//button[contains(text(), \"Got it — I'll follow the rules\")]",
+                "//button[contains(@class, 'cursor-pointer') and contains(text(), 'Got it')]",
+                "button.bg-primary-600.cursor-pointer"
+            ]
+            
+            botao = None
+            for selector in botao_selectors:
+                try:
+                    if selector.startswith("//"):
+                        botao = WebDriverWait(driver, 5).until(EC.element_to_be_clickable((By.XPATH, selector)))
+                    else:
+                        botao = WebDriverWait(driver, 5).until(EC.element_to_be_clickable((By.CSS_SELECTOR, selector)))
+                    print(f"[SUCCESS] Botão 'Got it' encontrado!")
+                    break
+                except:
+                    continue
+            
+            if not botao:
+                print("[ERROR] Botão 'Got it' não encontrado!")
+                return False
+            
+            # Aguarda 1 segundo e clica
+            time.sleep(1)
+            clicar_com_javascript(driver, botao)
+            print("[SUCCESS] Botão 'Got it' clicado!")
+            
+            # Aguarda redirecionamento
+            time.sleep(3)
+            
+            # Verifica para onde foi redirecionado
+            new_url = driver.current_url
+            print(f"[CHECK] Nova URL após clicar: {new_url}")
+            
+            # Se foi para raijin.gg%20+%20/policy-violation ou similar, vai para sign-up
+            if "policy-violation" in new_url or "%20" in new_url:
+                print("[REDIRECT] URL inválida detectada, indo para /sign-up...")
+                driver.get("https://raijin.gg/sign-up")
+                WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+                print("[WAIT] Aguardando 5 segundos em /sign-up...")
+                time.sleep(5)
+            
+            print("[SUCCESS] Policy violation tratada com sucesso!")
+            return True
+        
+        print("[SUCCESS] Nenhuma policy violation detectada!")
+        return False
+        
+    except Exception as e:
+        print(f"[ERROR] Erro ao verificar/tratar policy: {e}")
+        return False
+
+def ler_proxies():
+    """Lê o arquivo proxy.txt e retorna uma lista de dicionários com dados dos proxies"""
+    try:
+        caminho_arquivo = os.path.join(os.path.dirname(__file__), "proxy.txt")
+        if not os.path.exists(caminho_arquivo):
+            print(f"[WARNING] O arquivo proxy.txt não foi encontrado em {caminho_arquivo}")
+            print(f"[INFO] O bot continuará SEM usar proxies.")
+            return []
+        
+        proxies = []
+        with open(caminho_arquivo, 'r', encoding='utf-8') as arquivo:
+            for linha in arquivo:
+                linha = linha.strip()
+                if linha and ':' in linha:
+                    partes = linha.split(':')
+                    if len(partes) == 4:
+                        ip, port, username, password = partes
+                        proxies.append({
+                            'ip': ip,
+                            'port': port,
+                            'username': username,
+                            'password': password,
+                            'full': f"{ip}:{port}"
+                        })
+        
+        if proxies:
+            print(f"[SUCCESS] {len(proxies)} proxies carregados do arquivo proxy.txt")
+        else:
+            print(f"[WARNING] Nenhum proxy válido encontrado em proxy.txt")
+        
+        return proxies
+        
+    except Exception as e:
+        print(f"[ERROR] Erro ao ler proxy.txt: {e}")
+        return []
+
+def obter_proximo_proxy():
+    """Retorna o próximo proxy da lista de forma cíclica"""
+    global current_proxy_index
+    
+    if not proxies_list:
+        return None
+    
+    with proxy_index_lock:
+        proxy = proxies_list[current_proxy_index]
+        current_proxy_index = (current_proxy_index + 1) % len(proxies_list)
+        return proxy
+
+def criar_extensao_proxy_auth(proxy_data, profile_dir):
+    """Cria uma extensão Chrome para autenticação automática do proxy"""
+    try:
+        manifest_json = """
+        {
+            "version": "1.0.0",
+            "manifest_version": 2,
+            "name": "Chrome Proxy",
+            "permissions": [
+                "proxy",
+                "tabs",
+                "unlimitedStorage",
+                "storage",
+                "<all_urls>",
+                "webRequest",
+                "webRequestBlocking"
+            ],
+            "background": {
+                "scripts": ["background.js"]
+            },
+            "minimum_chrome_version":"22.0.0"
+        }
+        """
+        
+        background_js = """
+        var config = {
+                mode: "fixed_servers",
+                rules: {
+                  singleProxy: {
+                    scheme: "http",
+                    host: "%s",
+                    port: parseInt(%s)
+                  },
+                  bypassList: ["localhost"]
+                }
+              };
+
+        chrome.proxy.settings.set({value: config, scope: "regular"}, function() {});
+
+        function callbackFn(details) {
+            return {
+                authCredentials: {
+                    username: "%s",
+                    password: "%s"
+                }
+            };
+        }
+
+        chrome.webRequest.onAuthRequired.addListener(
+                    callbackFn,
+                    {urls: ["<all_urls>"]},
+                    ['blocking']
+        );
+        """ % (proxy_data['ip'], proxy_data['port'], proxy_data['username'], proxy_data['password'])
+        
+        plugin_dir = os.path.join(profile_dir, 'proxy_auth_plugin')
+        os.makedirs(plugin_dir, exist_ok=True)
+        
+        with open(os.path.join(plugin_dir, 'manifest.json'), 'w') as f:
+            f.write(manifest_json)
+        
+        with open(os.path.join(plugin_dir, 'background.js'), 'w') as f:
+            f.write(background_js)
+        
+        print(f"[PROXY] Extensão de autenticação criada para proxy {proxy_data['full']}")
+        return plugin_dir
+        
+    except Exception as e:
+        print(f"[ERROR] Erro ao criar extensão proxy: {e}")
+        return None
+
+def ler_contas():
+    """Lê o arquivo accounts.txt e retorna uma lista de tuplas (email, senha)"""
+    try:
+        caminho_arquivo = os.path.join(os.path.dirname(__file__), "accounts.txt")
+        if not os.path.exists(caminho_arquivo):
+            print(f"[ERROR] O arquivo accounts.txt não foi encontrado em {caminho_arquivo}")
+            return []
+        
+        contas = []
+        with open(caminho_arquivo, 'r', encoding='utf-8') as arquivo:
+            for linha in arquivo:
+                linha = linha.strip()
+                if linha and ':' in linha:
+                    email, senha = linha.split(':', 1)
+                    if email and senha:
+                        contas.append((email, senha))
+        
+        return contas
+        
+    except Exception as e:
+        print(f"[ERROR] Erro ao ler accounts.txt: {e}")
+        return []
+
+def verificar_brave_instalado():
+    """Verifica se o Brave está instalado e retorna o caminho correto"""
+    caminhos_possiveis = [
+        r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
+        r"C:\Program Files (x86)\BraveSoftware\Brave-Browser\Application\brave.exe",
+        os.path.expanduser(r"~\AppData\Local\BraveSoftware\Brave-Browser\Application\brave.exe"),
+    ]
+    
+    for caminho in caminhos_possiveis:
+        if os.path.exists(caminho):
+            return caminho
+    
+    return None
+
+def clicar_com_javascript(driver, elemento):
+    wait_if_paused()
+    try:
+        driver.execute_script("arguments[0].scrollIntoView(true);", elemento)
+        time.sleep(0.3)
+        driver.execute_script("arguments[0].click();", elemento)
+    except Exception as e:
+        if "stale element reference" in str(e).lower():
+            print(f"[WARNING] Elemento stale detectado - tentando re-localizar...")
+            raise e
+        else:
+            raise e
+
+def encontrar_e_clicar_com_retry(driver, seletores, nome_elemento, max_tentativas=3):
+    """Encontra e clica em elemento com retry automático para stale elements"""
+    wait_if_paused()
+    
+    for tentativa in range(1, max_tentativas + 1):
+        try:
+            print(f"[SEARCH] Procurando {nome_elemento} (tentativa {tentativa}/{max_tentativas})...")
+            
+            elemento = None
+            for selector in seletores:
+                try:
+                    if selector.startswith("//"):
+                        elemento = WebDriverWait(driver, 3).until(EC.element_to_be_clickable((By.XPATH, selector)))
+                    else:
+                        elemento = WebDriverWait(driver, 3).until(EC.element_to_be_clickable((By.CSS_SELECTOR, selector)))
+                    print(f"[SUCCESS] {nome_elemento} encontrado!")
+                    break
+                except:
+                    continue
+            
+            if not elemento:
+                print(f"[WARNING] {nome_elemento} não encontrado na tentativa {tentativa}")
+                if tentativa < max_tentativas:
+                    time.sleep(2)
+                    continue
+                else:
+                    return False
+            
+            clicar_com_javascript(driver, elemento)
+            print(f"[SUCCESS] {nome_elemento} clicado com sucesso!")
+            return True
+            
+        except Exception as e:
+            if "stale element reference" in str(e).lower():
+                print(f"[RETRY] Stale element detectado em {nome_elemento} - tentativa {tentativa}")
+                if tentativa < max_tentativas:
+                    time.sleep(2)
+                    continue
+                else:
+                    print(f"[ERROR] Stale element persistente em {nome_elemento} após {max_tentativas} tentativas")
+                    return False
+            else:
+                print(f"[ERROR] Erro inesperado em {nome_elemento}: {e}")
+                if tentativa < max_tentativas:
+                    time.sleep(1)
+                    continue
+                else:
+                    return False
+    
+    return False
+
+def executar_join_sorteio(driver, sorteio_url):
+    """Executa o join e confirm join no sorteio"""
+    wait_if_paused()
+    try:
+        # VERIFICAÇÃO DE POLICY ANTES DE IR PARA O SORTEIO
+        print(f"[CHECK] Verificando policy antes de acessar sorteio...")
+        verificar_e_tratar_policy(driver, sorteio_url)
+        
+        # Acessa a página do sorteio
+        print(f"[WEB] Acessando sorteio: {sorteio_url}")
+        driver.get(sorteio_url)
+        WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+        time.sleep(3)
+        
+        # VERIFICAÇÃO DE POLICY ANTES DE CLICAR EM JOIN
+        print(f"[CHECK] Verificação rápida de policy antes de clicar em Join...")
+        if verificar_e_tratar_policy(driver, sorteio_url):
+            # Se tratou policy, verifica se não foi para página inválida
+            if "policy-violation" in driver.current_url or "%20" in driver.current_url:
+                print("[REDIRECT] Voltando para /sign-up...")
+                driver.get("https://raijin.gg/sign-up")
+                WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+                time.sleep(5)
+                print("[REDIRECT] Voltando para página do sorteio...")
+                driver.get(sorteio_url)
+                WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+                time.sleep(2)
+        
+        # Procura e clica no botão Join
+        print(f"[SEARCH] Procurando botão Join...")
+        join_selectors = [
+            "//button[contains(text(), 'Join') and contains(@class, 'bg-mint-green-600')]",
+            "//button[contains(text(), 'Join · 0 Pass')]",
+            "//button[contains(text(), 'Join')]",
+            "//button[contains(@class, 'join')]",
+            "//div[contains(text(), 'Join')]/ancestor::button",
+            "//button[contains(text(), 'Entrar')]"
+        ]
+        
+        join_btn = None
+        for selector in join_selectors:
+            try:
+                join_btn = WebDriverWait(driver, 3).until(EC.element_to_be_clickable((By.XPATH, selector)))
+                print(f"[SUCCESS] Botão Join encontrado!")
+                break
+            except:
+                continue
+        
+        if not join_btn:
+            print(f"[WARNING] Botão Join não encontrado")
+            print(f"[INFO] Conta pode já estar no sorteio ou há algum erro")
+            return False
+        
+        clicar_com_javascript(driver, join_btn)
+        print(f"[SUCCESS] Join clicado.")
+        time.sleep(2)
+        
+        # Procura e clica no botão Confirm Join
+        try:
+            print("[SEARCH] Procurando botão 'Confirm and join'...")
+            confirm_selectors = [
+                "//button[contains(text(), 'Confirm and join')]",
+                "//button[contains(@class, 'confirm') and contains(text(), 'join')]",
+                "//button[text()='Confirm and join']"
+            ]
+            
+            confirm_btn = None
+            for confirm_selector in confirm_selectors:
+                try:
+                    confirm_btn = WebDriverWait(driver, 3).until(EC.element_to_be_clickable((By.XPATH, confirm_selector)))
+                    if confirm_btn.is_displayed() and confirm_btn.is_enabled():
+                        print(f"[SUCCESS] Botão 'Confirm and join' encontrado e ativo!")
+                        clicar_com_javascript(driver, confirm_btn)
+                        print(f"[SUCCESS] Confirm and join clicado com sucesso.")
+                        time.sleep(2)
+                        return True
+                    break
+                except:
+                    continue
+            
+            if not confirm_btn:
+                print(f"[SUCCESS] Join realizado sem popup de confirmação!")
+                return True
+                
+        except Exception as popup_error:
+            print(f"[WARNING] Erro ao verificar popup: {popup_error}")
+            print(f"[SUCCESS] Join realizado!")
+            return True
+        
+    except Exception as e:
+        print(f"[ERROR] Erro ao executar join no sorteio: {e}")
+        return False
+
+def obter_dimensoes_janela(thread_index, total_threads):
+    """Calcula dimensões e posicionamento da janela baseado no índice da thread"""
+    import math
+    
+    # Obter tamanho do monitor
+    try:
+        import tkinter
+        root = tkinter.Tk()
+        root.withdraw()
+        screen_width = root.winfo_screenwidth()
+        screen_height = root.winfo_screenheight()
+        root.destroy()
+    except:
+        # Valores padrão se não conseguir detectar
+        screen_width = 1920
+        screen_height = 1080
+    
+    # Calcular layout de grid
+    cols = math.ceil(math.sqrt(total_threads))
+    rows = math.ceil(total_threads / cols)
+    
+    # Calcular dimensões de cada janela
+    window_width = screen_width // cols
+    window_height = screen_height // rows
+    
+    # Calcular posição baseada no índice
+    col_index = thread_index % cols
+    row_index = thread_index // cols
+    
+    x_pos = col_index * window_width
+    y_pos = row_index * window_height
+    
+    return window_width, window_height, x_pos, y_pos
+
+def limpar_profile_temporario(profile_dir, email):
+    """Tenta limpar o perfil temporário criado"""
+    try:
+        import shutil
+        if os.path.exists(profile_dir):
+            print(f"[CLEAN] Removendo perfil temporário para {email}...")
+            shutil.rmtree(profile_dir, ignore_errors=True)
+            print(f"[SUCCESS] Perfil temporário removido!")
+    except Exception as e:
+        print(f"[WARNING] Não foi possível remover perfil temporário: {e}")
+
+def processar_conta(email, senha, link_sorteio, thread_index, max_workers, proxy_data=None):
+    """Processa uma conta específica"""
+    wait_if_paused()
+    
+    with processed_accounts_lock:
+        if email in processed_accounts:
+            print(f"[SKIP] Conta {email} já foi processada.")
+            return
+        processed_accounts.add(email)
+    
+    driver = None
+    profile_dir = None
+    
+    try:
+        options = webdriver.ChromeOptions()
+        
+        caminho_brave = verificar_brave_instalado()
+        if caminho_brave:
+            options.binary_location = caminho_brave
+        
+        options.add_argument("--disable-blink-features=AutomationControlled")
+        options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        options.add_experimental_option('useAutomationExtension', False)
+        
+        profile_dir = os.path.join(os.getenv('TEMP', '/tmp'), f"brave_profile_{uuid.uuid4().hex[:8]}_{int(time.time())}")
+        options.add_argument(f"--user-data-dir={profile_dir}")
+        options.add_argument("--no-first-run")
+        options.add_argument("--no-default-browser-check")
+        options.add_argument("--disable-default-apps")
+        options.add_argument("--disable-extensions")
+        options.add_argument("--disable-plugins")
+        options.add_argument("--disable-sync")
+        
+        print(f"[FOLDER] Criando perfil temporário: {os.path.basename(profile_dir)}")
+        
+        if proxy_data:
+            print(f"[PROXY] Configurando proxy {proxy_data['full']} para {email}")
+            plugin_dir = criar_extensao_proxy_auth(proxy_data, profile_dir)
+            if plugin_dir:
+                options.add_argument(f'--load-extension={plugin_dir}')
+                options.add_argument('--disable-extensions-except=' + plugin_dir)
+                try:
+                    options.arguments.remove('--disable-extensions')
+                except ValueError:
+                    pass
+                print(f"[SUCCESS] Proxy {proxy_data['full']} configurado com autenticação!")
+        else:
+            print(f"[INFO] Processando {email} SEM proxy")
+        
+        try:
+            print("[RETRY] Tentando ChromeDriver do sistema...")
+            driver = webdriver.Chrome(options=options)
+            print("[SUCCESS] ChromeDriver do sistema funcionou!")
+        except Exception as e:
+            print(f"[WARNING] Sistema falhou: {e}")
+            print("[RETRY] Usando ChromeDriverManager...")
+            driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+            print("[SUCCESS] ChromeDriverManager funcionou!")
+        
+        driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        
+        window_width, window_height, x_pos, y_pos = obter_dimensoes_janela(thread_index, max_workers)
+        driver.set_window_size(window_width, window_height)
+        driver.set_window_position(x_pos, y_pos)
+        
+        proxy_info = f" | Proxy: {proxy_data['full']}" if proxy_data else ""
+        print(f"[WINDOW] Janela para {email} em ({x_pos}, {y_pos}){proxy_info}")
+        
+        print(f"\n[WEB] Iniciando login Steam para: {email}")
+        driver.get("https://store.steampowered.com/login/")
+        
+        input_email_steam = WebDriverWait(driver, 20).until(EC.element_to_be_clickable((By.CSS_SELECTOR, "input._2GBWeup5cttgbTw8FM3tfx[type='text']")))
+        input_email_steam.clear()
+        input_email_steam.send_keys(email)
+        
+        input_senha_steam = driver.find_element(By.CSS_SELECTOR, "input._2GBWeup5cttgbTw8FM3tfx[type='password']")
+        input_senha_steam.clear()
+        input_senha_steam.send_keys(senha)
+        
+        botao_login_steam = driver.find_element(By.CSS_SELECTOR, "button.DjSvCZoKKfoNSmarsEcTS[type='submit']")
+        clicar_com_javascript(driver, botao_login_steam)
+        
+        print("[WAIT] Aguardando login Steam...")
+        time.sleep(8)
+        
+        print("[WEB] Acessando Raijin...")
+        driver.get("https://raijin.gg/giveaways")
+        
+        # ==== BOTÃO LOG IN ATUALIZADO COM NOVA ESTRUTURA ====
+        print("[LOGIN] Clicando em 'Log in' (com ícone Steam) no Raijin...")
+        login_selectors = [
+            "//button[.//img[@alt='Steam Icon'] and .//div[text()='Log in']]",
+            "//button[contains(@class, 'bg-zinc-800') and .//div[text()='Log in']]",
+            "//button[@data-slot='button' and .//div[text()='Log in']]",
+            "//button[.//img[contains(@src, 'steam')] and .//div[contains(text(), 'Log in')]]",
+            "//button[descendant::img[@alt='Steam Icon'] and descendant::div[text()='Log in']]",
+            "//button[.//div[text()='Log in' and not(contains(text(), 'Sign'))]]"
+        ]
+        
+        if not encontrar_e_clicar_com_retry(driver, login_selectors, "botão Log in (com ícone Steam)"):
+            print("[ERROR] Falha ao clicar em Log in - continuando...")
+        
+        time.sleep(1)
+        
+        print("[STEAM] Clicando em 'Continue with Steam'...")
+        steam_selectors = [
+            "//div[contains(@class, 'from-cyan-200') and contains(text(), 'Continue with Steam')]",
+            "//div[contains(text(), 'Continue with Steam')]",
+            "//div[contains(@class, 'bg-gradient-to-r')]//div[contains(text(), 'Continue with Steam')]",
+            "//img[@alt='Steam Icon']/parent::div/parent::div/parent::div",
+            "//img[contains(@alt, 'sign in with steam')]",
+            "img[alt*='steam']",
+            ".steam-login",
+            "//button[contains(text(), 'Steam')]"
+        ]
+        
+        if not encontrar_e_clicar_com_retry(driver, steam_selectors, "botão Continue with Steam"):
+            print("[ERROR] Falha ao clicar em Steam login - continuando...")
+        
+        print("[WAIT] Aguardando popup do Steam...")
+        WebDriverWait(driver, 20).until(lambda d: len(d.window_handles) > 1)
+        driver.switch_to.window(driver.window_handles[-1])
+        print("[SUCCESS] Mudou para popup do Steam.")
+        
+        print("[INPUT] Esperando e preenchendo credenciais no popup...")
+        input_email = WebDriverWait(driver, 20).until(EC.element_to_be_clickable((By.CSS_SELECTOR, "input._2GBWeup5cttgbTw8FM3tfx[type='text']")))
+        input_email.clear()
+        input_email.send_keys(email)
+        
+        input_senha = driver.find_element(By.CSS_SELECTOR, "input._2GBWeup5cttgbTw8FM3tfx[type='password']")
+        input_senha.clear()
+        input_senha.send_keys(senha)
+        
+        botao_login = driver.find_element(By.CSS_SELECTOR, "button.DjSvCZoKKfoNSmarsEcTS[type='submit']")
+        clicar_com_javascript(driver, botao_login)
+        print("[SUCCESS] Credenciais preenchidas e login clicado no popup.")
+        
+        try:
+            print("[KEY] Procurando botão 'Iniciar sessão' adicional...")
+            botao_login_adicional = WebDriverWait(driver, 10).until(EC.element_to_be_clickable((By.ID, "imageLogin")))
+            clicar_com_javascript(driver, botao_login_adicional)
+            print("[SUCCESS] Botão adicional clicado!")
+        except:
+            print("[WARNING] Botão adicional não encontrado, continuando...")
+        
+        print("[RETRY] Voltando para aba principal do Raijin...")
+        driver.switch_to.window(driver.window_handles[0])
+        
+        wait_if_paused()
+        
+        print("[RETRY] Verificando se precisa autenticar novamente...")
+        for tentativa in range(1, 7):
+            wait_if_paused()
+            print(f"[SEARCH] Tentativa {tentativa}/6 - Procurando botão Steam...")
+            time.sleep(8)
+            
+            try:
+                steam_selectors_retry = [
+                    "//div[contains(@class, 'from-cyan-200') and contains(text(), 'Continue with Steam')]",
+                    "//div[contains(text(), 'Continue with Steam')]",
+                    "//img[@alt='Steam Icon']/parent::div/parent::div/parent::div",
+                    "//img[contains(@alt, 'sign in with steam')]"
+                ]
+                
+                steam_elemento = None
+                for selector in steam_selectors_retry:
+                    try:
+                        steam_elemento = driver.find_element(By.XPATH, selector)
+                        if steam_elemento.is_displayed():
+                            break
+                    except:
+                        continue
+                
+                if steam_elemento and steam_elemento.is_displayed():
+                    print(f"[STEAM] Botão Continue with Steam encontrado na tentativa {tentativa}! Clicando...")
+                    
+                    if not encontrar_e_clicar_com_retry(driver, steam_selectors_retry, f"botão Steam (tentativa {tentativa})"):
+                        print(f"[ERROR] Falha ao clicar no Steam na tentativa {tentativa}")
+                        continue
+                    
+                    wait_if_paused()
+                    
+                    print("[WAIT] Aguardando nova aba do Steam...")
+                    WebDriverWait(driver, 10).until(lambda d: len(d.window_handles) > 1)
+                    driver.switch_to.window(driver.window_handles[-1])
+                    
+                    wait_if_paused()
+                    
+                    print("[WAIT] Aguardando página do Steam carregar...")
+                    time.sleep(3)
+                    
+                    try:
+                        botao_confirmar = WebDriverWait(driver, 10).until(
+                            EC.element_to_be_clickable((By.ID, "imageLogin"))
+                        )
+                        clicar_com_javascript(driver, botao_confirmar)
+                        print("[SUCCESS] Confirmação Steam clicada!")
+                        time.sleep(5)
+                    except:
+                        print("[WARNING] Botão de confirmação não encontrado...")
+                    
+                    driver.switch_to.window(driver.window_handles[0])
+                else:
+                    print(f"[INFO] Botão Steam não visível na tentativa {tentativa}")
+                    break
+                    
+            except:
+                print(f"[INFO] Botão Steam não encontrado na tentativa {tentativa}, login bem-sucedido.")
+                break
+        
+        print("[PARTY] Processo de login finalizado!")
+        
+        print("\n[SEARCH] === VERIFICAÇÃO DE ELEMENTOS DE REVIEW ===")
+        print("[WAIT] Verificação de 4 segundos...")
+        
+        elementos_review = [
+            "button.cursor-pointer.font-medium.underline.disabled\\:cursor-not-allowed.disabled\\:opacity-50",
+            "input[placeholder='Email address']",
+            "input[placeholder='Email address'][type='email']"
+        ]
+        
+        elemento_encontrado = False
+        for segundo in range(4):
+            wait_if_paused()
+            print(f"  Segundo {segundo + 1}/4 - Verificando...")
+            
+            for elemento in elementos_review:
+                try:
+                    elem = WebDriverWait(driver, 0.5).until(EC.presence_of_element_located((By.CSS_SELECTOR, elemento)))
+                    if elem.is_displayed():
+                        print(f"[WARNING] ELEMENTO DE REVIEW ENCONTRADO: {elemento}")
+                        print(f"[SAVE] Salvando conta {email} em review2.txt...")
+                        salvar_conta_review(email, senha)
+                        print(f"[ERROR] Pulando conta {email} - enviada para review.")
+                        elemento_encontrado = True
+                        break
+                except:
+                    continue
+            
+            if elemento_encontrado:
+                return
+            
+            time.sleep(1)
+        
+        print("[SUCCESS] Nenhum elemento de review encontrado - continuando com o giveaway!")
+        time.sleep(2)
+        
+        # Executar join e confirm join no sorteio
+        print(f"\n{'='*70}")
+        print(f"[GAME] === PROCESSANDO SORTEIO PARA {email} ===")
+        print(f"{'='*70}\n")
+        
+        if executar_join_sorteio(driver, link_sorteio):
+            print(f"[SUCCESS] ✅ Join e Confirm Join completados para {email}!")
+        else:
+            print(f"[ERROR] ❌ Erro ao processar join para {email}")
+            salvar_conta_erro(email, senha)
+        
+        # Aguarda 5 segundos antes da próxima conta
+        print(f"[WAIT] Aguardando 5 segundos antes da próxima conta...")
+        time.sleep(5)
+        
+    except Exception as e:
+        print(f"[ERROR] Erro ao processar a conta {email}: {e}")
+        salvar_conta_erro(email, senha)
+        
+    finally:
+        print(f"\n[CLEAN] === INICIANDO LIMPEZA PARA: {email} ===")
+        
+        if driver:
+            try:
+                print(f"[LOCK] Fechando navegador para {email}...")
+                driver.quit()
+                print(f"[SUCCESS] Navegador fechado com sucesso!")
+                time.sleep(2)
+            except Exception as e:
+                print(f"[WARNING] Erro ao fechar navegador: {e}")
+        
+        if profile_dir:
+            limpar_profile_temporario(profile_dir, email)
+        
+        print(f"[SUCCESS] === LIMPEZA CONCLUÍDA PARA: {email} ===\n")
+
+def main():
+    global proxies_list
+    
+    try:
+        import threading
+        threading.Thread(target=check_pause, daemon=True).start()
+        
+        print(f"\n{'='*70}")
+        print("RAIJIN JOIN BOT - VERSÃO SIMPLIFICADA")
+        print("Faz apenas Join e Confirm Join no sorteio")
+        print(f"{'='*70}\n")
+        
+        # Solicitar link do sorteio
+        print("Digite o link do sorteio Raijin:")
+        link_sorteio = input("Link: ").strip()
+        
+        if not link_sorteio:
+            print("[ERROR] Link do sorteio não fornecido!")
+            input("Pressione Enter para sair...")
+            return
+        
+        if "raijin" not in link_sorteio.lower():
+            print("[WARNING] O link não parece ser do Raijin. Continuando mesmo assim...")
+        
+        contas = ler_contas()
+        if not contas:
+            input("Pressione Enter para sair...")
+            return
+        
+        proxies_list = ler_proxies()
+        
+        if proxies_list:
+            print(f"[PROXY] Sistema de proxies ATIVADO - {len(proxies_list)} proxies disponíveis")
+        else:
+            print(f"[WARNING] Sistema de proxies DESATIVADO - processando sem proxies")
+        
+        print(f"\n[ACCOUNT] {len(contas)} contas carregadas do arquivo accounts.txt")
+        
+        print(f"\n{'='*70}")
+        print("Configurações:")
+        print(f"  - Link do sorteio: {link_sorteio}")
+        print(f"  - Total de contas: {len(contas)}")
+        print(f"  - Proxies disponíveis: {len(proxies_list) if proxies_list else 'Nenhum'}")
+        print(f"  - Pressione F2 para pausar/retomar durante a execução")
+        print(f"{'='*70}\n")
+        
+        max_workers = int(input("Quantas contas processar simultaneamente? (Recomendado: 1-5): ") or "1")
+        max_workers = max(1, min(10, max_workers))
+        
+        print(f"\n[START] Iniciando processamento com {max_workers} threads simultâneas...")
+        print(f"[INFO] Pressione F2 a qualquer momento para pausar/retomar\n")
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = []
+            for i, (email, senha) in enumerate(contas):
+                proxy_data = obter_proximo_proxy() if proxies_list else None
+                future = executor.submit(processar_conta, email, senha, link_sorteio, i % max_workers, max_workers, proxy_data)
+                futures.append(future)
+            
+            concurrent.futures.wait(futures)
+        
+        print(f"\n{'='*70}")
+        print("[COMPLETE] PROCESSAMENTO CONCLUÍDO!")
+        print(f"{'='*70}")
+        print(f"✅ Todas as contas foram processadas!")
+        print(f"📊 Verifique os arquivos:")
+        print(f"   - erro.txt: Contas com erro no processamento")
+        print(f"   - review2.txt: Contas que precisam de review")
+        print(f"{'='*70}\n")
+        
+    except KeyboardInterrupt:
+        print("\n[STOP] Processamento interrompido pelo usuário.")
+    except Exception as e:
+        print(f"[CRITICAL] Erro crítico: {e}")
+    
+    input("Pressione Enter para sair...")
+
+if __name__ == "__main__":
+    main()
